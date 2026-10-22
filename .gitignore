@@ -1,0 +1,6 @@
+/ScreenDimmer.exe
+/dist/
+*.pdb
+*.user
+*.suo
+/.vs/
