@@ -22,7 +22,7 @@ jobs:
 
       - name: Package
         shell: pwsh
-        run: Compress-Archive -LiteralPath ./dist/ScreenDimmer.exe, ./使用说明.md -DestinationPath ./dist/ScreenDimmer-windows.zip
+        run: Compress-Archive -LiteralPath ./dist/ScreenDimmer.exe, ./使用说明.md, ./LICENSE -DestinationPath ./dist/ScreenDimmer-windows.zip
 
       - name: Upload build
         uses: actions/upload-artifact@v7

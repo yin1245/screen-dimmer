@@ -10,7 +10,7 @@ $outputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromP
 $outputFile = Join-Path $outputPath 'ScreenDimmer.exe'
 Push-Location $PSScriptRoot
 try {
-    & $compiler /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 "/out:$outputFile" /win32manifest:app.manifest /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Core.dll ScreenDimmer.cs
+    & $compiler /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 "/out:$outputFile" /win32manifest:app.manifest /win32icon:assets/app.ico /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Core.dll ScreenDimmer.cs
     if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
     Write-Output $outputFile
 }

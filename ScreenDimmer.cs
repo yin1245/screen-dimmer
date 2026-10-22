@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("分屏息屏")]
 [assembly: System.Reflection.AssemblyDescription("Screen blackout controls for individual Windows monitors")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 namespace ScreenDimmer
 {
@@ -195,6 +195,8 @@ namespace ScreenDimmer
         private bool toggleKey;
         private bool restoreKey;
         private bool closing;
+        private bool exitRequested;
+        private bool trayNoticeShown;
         private static readonly Color Muted = Color.FromArgb(164, 175, 194);
         internal int BlackoutCount { get { return masks.Count; } }
         internal bool ShortcutsAvailable { get { return toggleKey && restoreKey; } }
@@ -202,7 +204,7 @@ namespace ScreenDimmer
         internal ControlWindow()
         {
             Text = "分屏息屏";
-            Icon = SystemIcons.Application;
+            Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             Font = new Font("Microsoft YaHei UI", 10);
             BackColor = Color.FromArgb(17, 20, 27);
             ForeColor = Color.FromArgb(239, 242, 249);
@@ -238,7 +240,7 @@ namespace ScreenDimmer
             var identify = Button("识别屏幕", false);
             identify.Click += delegate { Identify(); };
             var hide = Button("收起到托盘", false);
-            hide.Click += delegate { Hide(); };
+            hide.Click += delegate { HideToTray(); };
             actions.Controls.AddRange(new Control[] { apply, restore, identify, hide });
             layout.Controls.Add(actions, 0, 5);
 
@@ -252,7 +254,7 @@ namespace ScreenDimmer
             trayMenu.Items.Add("切换所选屏幕", null, delegate { ToggleSelection(); });
             trayMenu.Items.Add("全部恢复", null, delegate { RestoreAll(); });
             trayMenu.Items.Add(new ToolStripSeparator());
-            trayMenu.Items.Add("退出", null, delegate { Close(); });
+            trayMenu.Items.Add("退出", null, delegate { ExitApplication(); });
             tray = new NotifyIcon { Icon = Icon, Text = "分屏息屏", Visible = true, ContextMenuStrip = trayMenu };
             tray.DoubleClick += delegate { ShowControl(); };
             LoadScreens();
@@ -393,6 +395,22 @@ namespace ScreenDimmer
             Activate();
         }
 
+        private void HideToTray()
+        {
+            Hide();
+            if (!trayNoticeShown)
+            {
+                trayNoticeShown = true;
+                tray.ShowBalloonTip(2500, "分屏息屏已在后台运行", "双击托盘图标打开面板，右键菜单可退出程序。", ToolTipIcon.Info);
+            }
+        }
+
+        internal void ExitApplication()
+        {
+            exitRequested = true;
+            Close();
+        }
+
         private void Identify()
         {
             RestoreAll();
@@ -436,6 +454,22 @@ namespace ScreenDimmer
         {
             base.OnKeyDown(e);
             if (e.KeyCode == Keys.Escape) { RestoreAll(); e.Handled = true; }
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (WindowState == FormWindowState.Minimized && tray != null) HideToTray();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (e.CloseReason == CloseReason.UserClosing && !exitRequested)
+            {
+                e.Cancel = true;
+                HideToTray();
+            }
+            base.OnFormClosing(e);
         }
 
         protected override void WndProc(ref Message message)
