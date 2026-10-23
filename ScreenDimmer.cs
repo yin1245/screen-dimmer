@@ -10,8 +10,8 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("分屏息屏")]
 [assembly: System.Reflection.AssemblyDescription("Screen blackout controls for individual Windows monitors")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
 
 namespace ScreenDimmer
 {
@@ -35,19 +35,52 @@ namespace ScreenDimmer
     internal static class Program
     {
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            bool background = args.Any(arg => string.Equals(arg, "--background", StringComparison.OrdinalIgnoreCase));
             bool created;
             using (var instance = new Mutex(true, @"Local\ScreenDimmer.Desktop", out created))
             {
                 if (!created)
                 {
-                    Native.PostMessage(new IntPtr(0xffff), Native.ShowMessage, IntPtr.Zero, IntPtr.Zero);
+                    if (!background)
+                        Native.PostMessage(new IntPtr(0xffff), Native.ShowMessage, IntPtr.Zero, IntPtr.Zero);
                     return;
                 }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new ControlWindow());
+                using (var window = new ControlWindow())
+                using (var context = new ApplicationContext())
+                {
+                    window.FormClosed += delegate { context.ExitThread(); };
+                    if (!background) window.Show();
+                    Application.Run(context);
+                }
+            }
+        }
+    }
+
+    internal static class StartupSettings
+    {
+        internal const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        internal const string ValueName = "ScreenDimmer";
+        internal static string CommandLine { get { return "\"" + Application.ExecutablePath + "\" --background"; } }
+
+        internal static bool IsEnabled
+        {
+            get
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(RunKey))
+                    return key != null && string.Equals(key.GetValue(ValueName) as string, CommandLine, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        internal static void SetEnabled(bool enabled)
+        {
+            using (var key = Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (enabled) key.SetValue(ValueName, CommandLine, RegistryValueKind.String);
+                else key.DeleteValue(ValueName, false);
             }
         }
     }
@@ -230,6 +263,10 @@ namespace ScreenDimmer
             keepAwake = new CheckBox { Text = "息屏期间保持电脑和其他屏幕唤醒", AutoSize = true, Checked = true, Margin = new Padding(0, 8, 0, 0) };
             keepAwake.CheckedChanged += delegate { UpdateWakeState(); };
             options.Controls.Add(keepAwake);
+            var startWithWindows = new CheckBox { Text = "开机自启动（后台运行）", AutoSize = true,
+                Checked = StartupSettings.IsEnabled, Margin = new Padding(18, 8, 0, 0) };
+            startWithWindows.CheckedChanged += delegate { StartupSettings.SetEnabled(startWithWindows.Checked); };
+            options.Controls.Add(startWithWindows);
             layout.Controls.Add(options, 0, 4);
 
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, Margin = new Padding(0) };
@@ -260,6 +297,7 @@ namespace ScreenDimmer
             LoadScreens();
             SystemEvents.DisplaySettingsChanged += DisplayChanged;
             SystemEvents.SessionSwitch += SessionChanged;
+            RegisterShortcuts();
         }
 
         private static Label Label(string text, float size, Color color)
@@ -279,9 +317,8 @@ namespace ScreenDimmer
             return button;
         }
 
-        protected override void OnLoad(EventArgs e)
+        private void RegisterShortcuts()
         {
-            base.OnLoad(e);
             toggleKey = Native.RegisterHotKey(Handle, 1, 0x4007, (uint)Keys.B);
             restoreKey = Native.RegisterHotKey(Handle, 2, 0x4007, (uint)Keys.R);
             shortcuts.Text = (toggleKey ? "Ctrl + Alt + Shift + B 切换息屏" : "切换快捷键未能注册") + "    ·    " +
