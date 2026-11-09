@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -10,14 +11,21 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("分屏息屏")]
 [assembly: System.Reflection.AssemblyDescription("Screen blackout controls for individual Windows monitors")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
 
 namespace ScreenDimmer
 {
     internal static class Native
     {
         internal static readonly uint ShowMessage = RegisterWindowMessage("ScreenDimmer.ShowControl");
+        internal static readonly uint ToggleMessage = RegisterWindowMessage("ScreenDimmer.Toggle");
+        internal static readonly uint ApplyMessage = RegisterWindowMessage("ScreenDimmer.Apply");
+        internal static readonly uint RestoreMessage = RegisterWindowMessage("ScreenDimmer.Restore");
+        internal static readonly IntPtr HwndTopmost = new IntPtr(-1);
+        internal static readonly IntPtr PerMonitorAwareV2 = new IntPtr(-4);
+        internal const uint SwpNoSize = 0x0001, SwpNoMove = 0x0002, SwpNoActivate = 0x0010, SwpNoOwnerZOrder = 0x0200;
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         internal static extern uint RegisterWindowMessage(string name);
         [DllImport("user32.dll")]
@@ -30,6 +38,85 @@ namespace ScreenDimmer
         internal static extern IntPtr SetCursor(IntPtr cursor);
         [DllImport("kernel32.dll")]
         internal static extern uint SetThreadExecutionState(uint flags);
+        [DllImport("user32.dll")]
+        internal static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")]
+        private static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfoEx info);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool EnumDisplayDevices(string device, uint index, ref DisplayDevice info, uint flags);
+
+        private delegate bool MonitorEnumProc(IntPtr monitor, IntPtr dc, IntPtr rect, IntPtr data);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Rect { public int Left, Top, Right, Bottom; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct MonitorInfoEx
+        {
+            public int Size;
+            public Rect Monitor;
+            public Rect Work;
+            public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Device;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct DisplayDevice
+        {
+            public int Size;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Name;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string String;
+            public uint State;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Id;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Key;
+        }
+
+        /// <summary>Switches the calling thread to per-monitor DPI awareness (Windows 10 1703+).
+        /// Returns the previous context, or IntPtr.Zero when unsupported.</summary>
+        internal static IntPtr EnterPerMonitorDpi()
+        {
+            try { return SetThreadDpiAwarenessContext(PerMonitorAwareV2); }
+            catch (EntryPointNotFoundException) { return IntPtr.Zero; }
+        }
+
+        internal static void LeaveDpi(IntPtr previous)
+        {
+            if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+        }
+
+        /// <summary>Physical-pixel bounds of every monitor, keyed by GDI device name.</summary>
+        internal static Dictionary<string, Rectangle> PhysicalMonitorBounds()
+        {
+            var result = new Dictionary<string, Rectangle>(StringComparer.OrdinalIgnoreCase);
+            IntPtr previous = EnterPerMonitorDpi();
+            if (previous == IntPtr.Zero) return result;
+            try
+            {
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr monitor, IntPtr dc, IntPtr rect, IntPtr data)
+                {
+                    var info = new MonitorInfoEx { Size = Marshal.SizeOf(typeof(MonitorInfoEx)) };
+                    if (GetMonitorInfo(monitor, ref info))
+                        result[info.Device] = Rectangle.FromLTRB(info.Monitor.Left, info.Monitor.Top, info.Monitor.Right, info.Monitor.Bottom);
+                    return true;
+                }, IntPtr.Zero);
+            }
+            finally { LeaveDpi(previous); }
+            return result;
+        }
+
+        /// <summary>Stable identifier of the physical monitor attached to a GDI device such as \\.\DISPLAY2.
+        /// GDI device numbers change after reboots and docking; the monitor interface path does not.</summary>
+        internal static string MonitorKey(string deviceName)
+        {
+            var info = new DisplayDevice { Size = Marshal.SizeOf(typeof(DisplayDevice)) };
+            if (EnumDisplayDevices(deviceName, 0, ref info, 1) && !string.IsNullOrEmpty(info.Id))
+                return info.Id;
+            return deviceName;
+        }
     }
 
     internal static class Program
@@ -37,26 +124,39 @@ namespace ScreenDimmer
         [STAThread]
         private static void Main(string[] args)
         {
-            bool background = args.Any(arg => string.Equals(arg, "--background", StringComparison.OrdinalIgnoreCase));
+            bool background = HasArg(args, "--background");
+            uint command = HasArg(args, "--toggle") ? Native.ToggleMessage :
+                HasArg(args, "--apply") ? Native.ApplyMessage :
+                HasArg(args, "--restore") ? Native.RestoreMessage : 0;
             bool created;
             using (var instance = new Mutex(true, @"Local\ScreenDimmer.Desktop", out created))
             {
                 if (!created)
                 {
-                    if (!background)
+                    if (command != 0)
+                        Native.PostMessage(new IntPtr(0xffff), command, IntPtr.Zero, IntPtr.Zero);
+                    else if (!background)
                         Native.PostMessage(new IntPtr(0xffff), Native.ShowMessage, IntPtr.Zero, IntPtr.Zero);
                     return;
                 }
+                if (command == Native.RestoreMessage) return;
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
+                StartupSettings.RepairIfMoved();
                 using (var window = new ControlWindow())
                 using (var context = new ApplicationContext())
                 {
                     window.FormClosed += delegate { context.ExitThread(); };
-                    if (!background) window.Show();
+                    if (!background && command == 0) window.Show();
+                    if (command != 0) window.RunCommand(command);
                     Application.Run(context);
                 }
             }
+        }
+
+        private static bool HasArg(string[] args, string name)
+        {
+            return args.Any(arg => string.Equals(arg, name, StringComparison.OrdinalIgnoreCase));
         }
     }
 
@@ -83,11 +183,58 @@ namespace ScreenDimmer
                 else key.DeleteValue(ValueName, false);
             }
         }
+
+        /// <summary>Points an existing login entry at this copy when the program file it names no longer exists.</summary>
+        internal static void RepairIfMoved()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                {
+                    string value = key == null ? null : key.GetValue(ValueName) as string;
+                    if (string.IsNullOrEmpty(value) || string.Equals(value, CommandLine, StringComparison.OrdinalIgnoreCase)) return;
+                    string path = value.StartsWith("\"") ? value.Substring(1, Math.Max(0, value.IndexOf('"', 1) - 1)) : value.Split(' ')[0];
+                    if (!File.Exists(path)) key.SetValue(ValueName, CommandLine, RegistryValueKind.String);
+                }
+            }
+            catch (Exception) { }
+        }
+    }
+
+    internal static class SelectionStore
+    {
+        private const string KeyPath = @"Software\ScreenDimmer";
+        private const string ValueName = "SelectedMonitors";
+
+        /// <summary>Saved monitor keys, or null when the user has never chosen.</summary>
+        internal static HashSet<string> Load()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    var values = key == null ? null : key.GetValue(ValueName) as string[];
+                    return values == null ? null : new HashSet<string>(values, StringComparer.OrdinalIgnoreCase);
+                }
+            }
+            catch (Exception) { return null; }
+        }
+
+        internal static void Save(IEnumerable<string> monitorKeys)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue(ValueName, monitorKeys.ToArray(), RegistryValueKind.MultiString);
+            }
+            catch (Exception) { }
+        }
     }
 
     internal sealed class MonitorCard : CheckBox
     {
         internal readonly Screen Display;
+        internal readonly string MonitorKey;
         internal int Number { get; private set; }
         internal bool Blanked;
         private static readonly Color Accent = Color.FromArgb(114, 158, 255);
@@ -95,6 +242,7 @@ namespace ScreenDimmer
         internal MonitorCard(Screen display, int number)
         {
             Display = display;
+            MonitorKey = Native.MonitorKey(display.DeviceName);
             Number = number;
             Appearance = Appearance.Button;
             AutoSize = false;
@@ -160,12 +308,15 @@ namespace ScreenDimmer
 
     internal sealed class BlackoutWindow : Form
     {
+        private const int WmSetCursor = 0x20, WmDpiChanged = 0x02E0;
         private readonly Action restore;
+        private readonly Rectangle physical;
         internal readonly string DeviceName;
 
-        internal BlackoutWindow(Screen display, Action restoreScreen, Action restoreAll)
+        internal BlackoutWindow(Screen display, Rectangle physicalBounds, Action restoreScreen, Action restoreAll)
         {
             DeviceName = display.DeviceName;
+            physical = physicalBounds;
             restore = restoreScreen;
             Text = "分屏息屏 · " + display.DeviceName;
             BackColor = Color.Black;
@@ -184,6 +335,39 @@ namespace ScreenDimmer
 
         protected override bool ShowWithoutActivation { get { return true; } }
 
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var parameters = base.CreateParams;
+                parameters.ExStyle |= 0x80; // WS_EX_TOOLWINDOW: never listed in Alt+Tab
+                return parameters;
+            }
+        }
+
+        // The mask is created per-monitor DPI aware so that it can be sized in physical pixels.
+        // The control panel stays system-DPI aware; WinForms on .NET Framework scales it correctly that way.
+        protected override void CreateHandle()
+        {
+            IntPtr previous = physical.IsEmpty ? IntPtr.Zero : Native.EnterPerMonitorDpi();
+            try { base.CreateHandle(); }
+            finally { Native.LeaveDpi(previous); }
+            Reassert();
+        }
+
+        /// <summary>Puts the mask back on top of every other topmost window and over its whole monitor.</summary>
+        internal void Reassert()
+        {
+            // Raising the mask while its right-click menu is open would hide the menu behind it.
+            if (!IsHandleCreated || (ContextMenuStrip != null && ContextMenuStrip.Visible)) return;
+            if (physical.IsEmpty)
+                Native.SetWindowPos(Handle, Native.HwndTopmost, 0, 0, 0, 0,
+                    Native.SwpNoMove | Native.SwpNoSize | Native.SwpNoActivate | Native.SwpNoOwnerZOrder);
+            else
+                Native.SetWindowPos(Handle, Native.HwndTopmost, physical.Left, physical.Top, physical.Width, physical.Height,
+                    Native.SwpNoActivate | Native.SwpNoOwnerZOrder);
+        }
+
         protected override void OnMouseDoubleClick(MouseEventArgs e)
         {
             base.OnMouseDoubleClick(e);
@@ -198,10 +382,17 @@ namespace ScreenDimmer
 
         protected override void WndProc(ref Message message)
         {
-            if (message.Msg == 0x20 && (message.LParam.ToInt64() & 0xffff) == 1)
+            if (message.Msg == WmSetCursor && (message.LParam.ToInt64() & 0xffff) == 1)
             {
                 Native.SetCursor(IntPtr.Zero);
                 message.Result = new IntPtr(1);
+                return;
+            }
+            if (message.Msg == WmDpiChanged)
+            {
+                // Ignore the suggested rectangle; the mask must always match its monitor exactly.
+                Reassert();
+                message.Result = IntPtr.Zero;
                 return;
             }
             base.WndProc(ref message);
@@ -216,6 +407,7 @@ namespace ScreenDimmer
 
     internal sealed class ControlWindow : Form
     {
+        private const uint EsContinuous = 0x80000000u, EsSystem = 0x1u, EsDisplay = 0x2u;
         private readonly List<MonitorCard> cards = new List<MonitorCard>();
         private readonly Dictionary<string, BlackoutWindow> masks = new Dictionary<string, BlackoutWindow>();
         private readonly FlowLayoutPanel screenPanel;
@@ -225,11 +417,14 @@ namespace ScreenDimmer
         private readonly ContextMenuStrip trayMenu;
         private readonly CheckBox keepAwake;
         private readonly Button apply;
+        private readonly System.Windows.Forms.Timer guard;
         private bool toggleKey;
         private bool restoreKey;
         private bool closing;
         private bool exitRequested;
         private bool trayNoticeShown;
+        private bool locked;
+        private bool loading;
         private static readonly Color Muted = Color.FromArgb(164, 175, 194);
         internal int BlackoutCount { get { return masks.Count; } }
         internal bool ShortcutsAvailable { get { return toggleKey && restoreKey; } }
@@ -255,7 +450,7 @@ namespace ScreenDimmer
             Controls.Add(layout);
             layout.Controls.Add(Label("分屏息屏", 22, Color.White), 0, 0);
             layout.Controls.Add(Label("让选中的屏幕变黑，其他屏幕照常使用。", 10, Muted), 0, 1);
-            layout.Controls.Add(Label("选择需要息屏的屏幕", 10, Color.FromArgb(208, 216, 231)), 0, 2);
+            layout.Controls.Add(Label("选择需要息屏的屏幕（选择会被记住）", 10, Color.FromArgb(208, 216, 231)), 0, 2);
             screenPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, AutoScroll = true, Margin = new Padding(0, 5, 0, 0) };
             layout.Controls.Add(screenPanel, 0, 3);
 
@@ -294,6 +489,11 @@ namespace ScreenDimmer
             trayMenu.Items.Add("退出", null, delegate { ExitApplication(); });
             tray = new NotifyIcon { Icon = Icon, Text = "分屏息屏", Visible = true, ContextMenuStrip = trayMenu };
             tray.DoubleClick += delegate { ShowControl(); };
+
+            // Taskbar, notifications and other topmost windows can rise above a mask after it is shown.
+            guard = new System.Windows.Forms.Timer { Interval = 1500 };
+            guard.Tick += delegate { foreach (var mask in masks.Values) mask.Reassert(); };
+
             LoadScreens();
             SystemEvents.DisplaySettingsChanged += DisplayChanged;
             SystemEvents.SessionSwitch += SessionChanged;
@@ -327,8 +527,8 @@ namespace ScreenDimmer
 
         private void LoadScreens()
         {
-            var selected = new HashSet<string>(cards.Where(c => c.Checked).Select(c => c.Display.DeviceName));
-            bool first = cards.Count == 0;
+            loading = true;
+            HashSet<string> saved = SelectionStore.Load();
             foreach (var card in cards) card.Dispose();
             cards.Clear();
             screenPanel.Controls.Clear();
@@ -336,13 +536,35 @@ namespace ScreenDimmer
             for (int i = 0; i < screens.Length; i++)
             {
                 var card = new MonitorCard(screens[i], i + 1);
-                card.Checked = first ? !screens[i].Primary : selected.Contains(screens[i].DeviceName);
-                card.CheckedChanged += delegate { apply.Enabled = cards.Any(c => c.Checked); };
+                card.Checked = saved == null ? !screens[i].Primary : saved.Contains(card.MonitorKey);
+                card.CheckedChanged += delegate { SelectionChanged(); };
                 cards.Add(card);
                 screenPanel.Controls.Add(card);
             }
+            loading = false;
             apply.Enabled = cards.Any(c => c.Checked);
             UpdateStatus();
+        }
+
+        private void SelectionChanged()
+        {
+            apply.Enabled = cards.Any(c => c.Checked);
+            if (loading) return;
+            // Keep the choices of monitors that are currently unplugged.
+            var keys = SelectionStore.Load() ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var card in cards)
+            {
+                if (card.Checked) keys.Add(card.MonitorKey);
+                else keys.Remove(card.MonitorKey);
+            }
+            SelectionStore.Save(keys);
+        }
+
+        internal void RunCommand(uint command)
+        {
+            if (command == Native.ToggleMessage) ToggleSelection();
+            else if (command == Native.ApplyMessage) { if (masks.Count == 0) ApplySelection(); }
+            else if (command == Native.RestoreMessage) RestoreAll();
         }
 
         internal void ApplySelection()
@@ -354,16 +576,20 @@ namespace ScreenDimmer
             if (visible != null && selected.Any(c => c.Display.Bounds.IntersectsWith(Bounds)))
                 CenterOn(visible);
             if (visible == null) Hide();
+            var physical = Native.PhysicalMonitorBounds();
             foreach (var card in selected)
             {
                 string device = card.Display.DeviceName;
-                var mask = new BlackoutWindow(card.Display, delegate { RestoreScreen(device); }, delegate { RestoreAll(); });
+                Rectangle exact;
+                if (!physical.TryGetValue(device, out exact)) exact = Rectangle.Empty;
+                var mask = new BlackoutWindow(card.Display, exact, delegate { RestoreScreen(device); }, delegate { RestoreAll(); });
+                MonitorCard owner = card;
                 mask.FormClosed += delegate
                 {
                     if (masks.Remove(device))
                     {
-                        card.Blanked = false;
-                        card.Invalidate();
+                        owner.Blanked = false;
+                        owner.Invalidate();
                         UpdateWakeState();
                         UpdateStatus();
                     }
@@ -405,7 +631,10 @@ namespace ScreenDimmer
 
         private void UpdateWakeState()
         {
-            Native.SetThreadExecutionState(masks.Count > 0 && keepAwake.Checked ? 0x80000003u : 0x80000000u);
+            // While the session is locked the remaining monitors may sleep as Windows normally decides.
+            bool hold = masks.Count > 0 && keepAwake.Checked && !locked;
+            Native.SetThreadExecutionState(hold ? EsContinuous | EsSystem | EsDisplay : EsContinuous);
+            guard.Enabled = masks.Count > 0;
         }
 
         private void UpdateStatus()
@@ -475,16 +704,31 @@ namespace ScreenDimmer
                 bool sameLayout = screens.Length == cards.Count && cards.All(card => screens.Any(screen =>
                     screen.DeviceName == card.Display.DeviceName && screen.Bounds == card.Display.Bounds &&
                     screen.Primary == card.Display.Primary));
-                if (sameLayout) return;
+                if (sameLayout)
+                {
+                    foreach (var mask in masks.Values) mask.Reassert();
+                    return;
+                }
+                bool wasActive = masks.Count > 0;
                 RestoreAll();
                 LoadScreens();
+                // Monitors that are still connected and still selected go dark again.
+                if (wasActive && cards.Any(c => c.Checked)) ApplySelection();
             });
         }
 
         private void SessionChanged(object sender, SessionSwitchEventArgs e)
         {
-            if (e.Reason == SessionSwitchReason.SessionLock && !closing && IsHandleCreated)
-                BeginInvoke((Action)delegate { RestoreAll(); });
+            if (closing || !IsHandleCreated) return;
+            if (e.Reason == SessionSwitchReason.SessionLock || e.Reason == SessionSwitchReason.ConsoleDisconnect)
+                BeginInvoke((Action)delegate { locked = true; UpdateWakeState(); });
+            else if (e.Reason == SessionSwitchReason.SessionUnlock || e.Reason == SessionSwitchReason.ConsoleConnect)
+                BeginInvoke((Action)delegate
+                {
+                    locked = false;
+                    foreach (var mask in masks.Values) mask.Reassert();
+                    UpdateWakeState();
+                });
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
@@ -511,7 +755,13 @@ namespace ScreenDimmer
 
         protected override void WndProc(ref Message message)
         {
-            if ((uint)message.Msg == Native.ShowMessage) { ShowControl(); return; }
+            uint msg = (uint)message.Msg;
+            if (msg == Native.ShowMessage) { ShowControl(); return; }
+            if (msg == Native.ToggleMessage || msg == Native.ApplyMessage || msg == Native.RestoreMessage)
+            {
+                RunCommand(msg);
+                return;
+            }
             if (message.Msg == 0x312)
             {
                 if (message.WParam.ToInt32() == 1) ToggleSelection();
@@ -524,11 +774,14 @@ namespace ScreenDimmer
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             closing = true;
+            guard.Stop();
             SystemEvents.DisplaySettingsChanged -= DisplayChanged;
             SystemEvents.SessionSwitch -= SessionChanged;
             RestoreAll();
+            Native.SetThreadExecutionState(EsContinuous);
             Native.UnregisterHotKey(Handle, 1);
             Native.UnregisterHotKey(Handle, 2);
+            guard.Dispose();
             tray.Visible = false;
             tray.Dispose();
             trayMenu.Dispose();
