@@ -11,8 +11,8 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("分屏息屏")]
 [assembly: System.Reflection.AssemblyDescription("Screen blackout controls for individual Windows monitors")]
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
 
 namespace ScreenDimmer
 {
@@ -108,6 +108,19 @@ namespace ScreenDimmer
             return result;
         }
 
+        /// <summary>HMONITOR handles of every monitor, keyed by GDI device name.</summary>
+        internal static Dictionary<string, IntPtr> MonitorHandles()
+        {
+            var result = new Dictionary<string, IntPtr>(StringComparer.OrdinalIgnoreCase);
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr monitor, IntPtr dc, IntPtr rect, IntPtr data)
+            {
+                var info = new MonitorInfoEx { Size = Marshal.SizeOf(typeof(MonitorInfoEx)) };
+                if (GetMonitorInfo(monitor, ref info)) result[info.Device] = monitor;
+                return true;
+            }, IntPtr.Zero);
+            return result;
+        }
+
         /// <summary>Stable identifier of the physical monitor attached to a GDI device such as \\.\DISPLAY2.
         /// GDI device numbers change after reboots and docking; the monitor interface path does not.</summary>
         internal static string MonitorKey(string deviceName)
@@ -117,6 +130,131 @@ namespace ScreenDimmer
                 return info.Id;
             return deviceName;
         }
+    }
+
+    /// <summary>Monitor brightness (backlight) control over DDC/CI, MCCS VCP code 0x10.</summary>
+    internal static class Ddc
+    {
+        private const byte Brightness = 0x10;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PhysicalMonitor
+        {
+            public IntPtr Handle;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string Description;
+        }
+
+        [DllImport("dxva2.dll", SetLastError = true)]
+        private static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr monitor, out uint count);
+        [DllImport("dxva2.dll", SetLastError = true)]
+        private static extern bool GetPhysicalMonitorsFromHMONITOR(IntPtr monitor, uint count, [Out] PhysicalMonitor[] monitors);
+        [DllImport("dxva2.dll", SetLastError = true)]
+        private static extern bool DestroyPhysicalMonitors(uint count, PhysicalMonitor[] monitors);
+        [DllImport("dxva2.dll", SetLastError = true)]
+        private static extern bool GetVCPFeatureAndVCPFeatureReply(IntPtr monitor, byte code, IntPtr type, out uint current, out uint maximum);
+        [DllImport("dxva2.dll", SetLastError = true)]
+        private static extern bool SetVCPFeature(IntPtr monitor, byte code, uint value);
+
+        /// <summary>Current brightness of the monitor behind a GDI device, or -1 when it does not answer over DDC/CI.</summary>
+        internal static int GetBrightness(string deviceName)
+        {
+            int result = -1;
+            WithMonitor(deviceName, delegate (IntPtr handle)
+            {
+                uint current, maximum;
+                if (GetVCPFeatureAndVCPFeatureReply(handle, Brightness, IntPtr.Zero, out current, out maximum) && maximum > 0)
+                    result = (int)current;
+            });
+            return result;
+        }
+
+        /// <summary>Sets the brightness and reads it back. Returns true only when the monitor reports the new value.</summary>
+        internal static bool SetBrightness(string deviceName, int value)
+        {
+            bool confirmed = false;
+            WithMonitor(deviceName, delegate (IntPtr handle)
+            {
+                for (int attempt = 0; attempt < 3 && !confirmed; attempt++)
+                {
+                    if (attempt > 0) Thread.Sleep(100);
+                    uint current, maximum;
+                    confirmed = SetVCPFeature(handle, Brightness, (uint)value) &&
+                        GetVCPFeatureAndVCPFeatureReply(handle, Brightness, IntPtr.Zero, out current, out maximum) &&
+                        current == (uint)value;
+                }
+            });
+            return confirmed;
+        }
+
+        private static void WithMonitor(string deviceName, Action<IntPtr> action)
+        {
+            IntPtr monitor;
+            if (!Native.MonitorHandles().TryGetValue(deviceName, out monitor)) return;
+            try
+            {
+                uint count;
+                if (!GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, out count) || count == 0) return;
+                var physical = new PhysicalMonitor[count];
+                if (!GetPhysicalMonitorsFromHMONITOR(monitor, count, physical)) return;
+                try { action(physical[0].Handle); }
+                finally { DestroyPhysicalMonitors(count, physical); }
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
+    }
+
+    /// <summary>Brightness values to put back, saved per monitor so that they survive a crash or a forced exit.</summary>
+    internal static class SavedBrightness
+    {
+        private const string KeyPath = @"Software\ScreenDimmer\SavedBrightness";
+
+        internal static int Get(string monitorKey)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(KeyPath))
+                {
+                    object value = key == null ? null : key.GetValue(Name(monitorKey));
+                    return value is int ? (int)value : -1;
+                }
+            }
+            catch (Exception) { return -1; }
+        }
+
+        internal static void Set(string monitorKey, int brightness)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                    key.SetValue(Name(monitorKey), brightness, RegistryValueKind.DWord);
+            }
+            catch (Exception) { }
+        }
+
+        internal static void Clear(string monitorKey)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(KeyPath, true))
+                    if (key != null) key.DeleteValue(Name(monitorKey), false);
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>Puts back the brightness of every connected monitor that a previous run left dimmed.</summary>
+        internal static void RestoreLeftovers()
+        {
+            foreach (var screen in Screen.AllScreens)
+            {
+                string monitorKey = Native.MonitorKey(screen.DeviceName);
+                int original = Get(monitorKey);
+                if (original >= 0 && Ddc.SetBrightness(screen.DeviceName, original)) Clear(monitorKey);
+            }
+        }
+
+        // Value names may contain backslashes, but forward slashes keep the entries readable in regedit and reg.exe.
+        private static string Name(string monitorKey) { return monitorKey.Replace('\\', '/'); }
     }
 
     internal static class Program
@@ -139,6 +277,8 @@ namespace ScreenDimmer
                         Native.PostMessage(new IntPtr(0xffff), Native.ShowMessage, IntPtr.Zero, IntPtr.Zero);
                     return;
                 }
+                // A previous run that ended without restoring (crash, killed process) may have left a monitor dimmed.
+                SavedBrightness.RestoreLeftovers();
                 if (command == Native.RestoreMessage) return;
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
@@ -237,6 +377,7 @@ namespace ScreenDimmer
         internal readonly string MonitorKey;
         internal int Number { get; private set; }
         internal bool Blanked;
+        internal bool Dimmed;
         private static readonly Color Accent = Color.FromArgb(114, 158, 255);
 
         internal MonitorCard(Screen display, int number)
@@ -288,7 +429,7 @@ namespace ScreenDimmer
                 using (var pen = new Pen(Accent, 2))
                     g.DrawLines(pen, new[] { new Point(26, 140), new Point(30, 144), new Point(36, 136) });
             }
-            DrawText(g, Blanked ? "正在息屏" : Checked ? "已选 · 应用后息屏" : "保持显示",
+            DrawText(g, Blanked ? (Dimmed ? "正在息屏 · 亮度已调到最低" : "正在息屏 · 黑屏遮罩") : Checked ? "已选 · 应用后息屏" : "保持显示",
                 new Rectangle(49, 127, 235, 28), 10, Checked ? Accent : Color.FromArgb(200, 207, 220));
             if (Focused)
                 ControlPaint.DrawFocusRectangle(g, new Rectangle(8, 8, 287, 157), Accent, BackColor);
@@ -416,6 +557,7 @@ namespace ScreenDimmer
         private readonly NotifyIcon tray;
         private readonly ContextMenuStrip trayMenu;
         private readonly CheckBox keepAwake;
+        private readonly CheckBox dimBacklight;
         private readonly Button apply;
         private readonly System.Windows.Forms.Timer guard;
         private bool toggleKey;
@@ -438,14 +580,14 @@ namespace ScreenDimmer
             ForeColor = Color.FromArgb(239, 242, 249);
             AutoScaleDimensions = new SizeF(96, 96);
             AutoScaleMode = AutoScaleMode.Dpi;
-            ClientSize = new Size(700, 526);
+            ClientSize = new Size(700, 562);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             KeyPreview = true;
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(28, 22, 28, 22), ColumnCount = 1, RowCount = 8 };
-            foreach (int height in new[] { 48, 37, 32, 192, 42, 52, 40, 39 })
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(28, 22, 28, 22), ColumnCount = 1, RowCount = 9 };
+            foreach (int height in new[] { 48, 37, 32, 192, 36, 42, 52, 40, 39 })
                 layout.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
             Controls.Add(layout);
             layout.Controls.Add(Label("分屏息屏", 22, Color.White), 0, 0);
@@ -453,6 +595,11 @@ namespace ScreenDimmer
             layout.Controls.Add(Label("选择需要息屏的屏幕（选择会被记住）", 10, Color.FromArgb(208, 216, 231)), 0, 2);
             screenPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, AutoScroll = true, Margin = new Padding(0, 5, 0, 0) };
             layout.Controls.Add(screenPanel, 0, 3);
+
+            dimBacklight = new CheckBox { Text = "息屏时把显示器亮度调到最低，恢复时还原（需显示器支持 DDC/CI）",
+                AutoSize = true, Checked = DimPreference, Margin = new Padding(0, 8, 0, 0) };
+            dimBacklight.CheckedChanged += delegate { DimBacklightChanged(); };
+            layout.Controls.Add(dimBacklight, 0, 4);
 
             var options = new FlowLayoutPanel { Dock = DockStyle.Fill, Margin = new Padding(0) };
             keepAwake = new CheckBox { Text = "息屏期间保持电脑和其他屏幕唤醒", AutoSize = true, Checked = true, Margin = new Padding(0, 8, 0, 0) };
@@ -462,7 +609,7 @@ namespace ScreenDimmer
                 Checked = StartupSettings.IsEnabled, Margin = new Padding(18, 8, 0, 0) };
             startWithWindows.CheckedChanged += delegate { StartupSettings.SetEnabled(startWithWindows.Checked); };
             options.Controls.Add(startWithWindows);
-            layout.Controls.Add(options, 0, 4);
+            layout.Controls.Add(options, 0, 5);
 
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, Margin = new Padding(0) };
             apply = Button("应用息屏", true);
@@ -474,12 +621,12 @@ namespace ScreenDimmer
             var hide = Button("收起到托盘", false);
             hide.Click += delegate { HideToTray(); };
             actions.Controls.AddRange(new Control[] { apply, restore, identify, hide });
-            layout.Controls.Add(actions, 0, 5);
+            layout.Controls.Add(actions, 0, 6);
 
             shortcuts = Label("", 9, Muted);
-            layout.Controls.Add(shortcuts, 0, 6);
+            layout.Controls.Add(shortcuts, 0, 7);
             status = Label("", 9, Muted);
-            layout.Controls.Add(status, 0, 7);
+            layout.Controls.Add(status, 0, 8);
 
             trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add("打开控制面板", null, delegate { ShowControl(); });
@@ -589,6 +736,7 @@ namespace ScreenDimmer
                     if (masks.Remove(device))
                     {
                         owner.Blanked = false;
+                        Undim(owner);
                         owner.Invalidate();
                         UpdateWakeState();
                         UpdateStatus();
@@ -597,6 +745,7 @@ namespace ScreenDimmer
                 masks.Add(device, mask);
                 mask.Show();
                 card.Blanked = true;
+                if (dimBacklight.Checked) Dim(card);
                 card.Invalidate();
             }
             UpdateWakeState();
@@ -618,9 +767,71 @@ namespace ScreenDimmer
             foreach (var card in cards.Where(c => c.Display.DeviceName == device))
             {
                 card.Blanked = false;
+                Undim(card);
                 card.Invalidate();
             }
             UpdateWakeState();
+            UpdateStatus();
+        }
+
+        private static bool DimPreference
+        {
+            get
+            {
+                try
+                {
+                    using (var key = Registry.CurrentUser.OpenSubKey(@"Software\ScreenDimmer"))
+                    {
+                        object value = key == null ? null : key.GetValue("DimBacklight");
+                        return !(value is int) || (int)value != 0;
+                    }
+                }
+                catch (Exception) { return true; }
+            }
+            set
+            {
+                try
+                {
+                    using (var key = Registry.CurrentUser.CreateSubKey(@"Software\ScreenDimmer"))
+                        key.SetValue("DimBacklight", value ? 1 : 0, RegistryValueKind.DWord);
+                }
+                catch (Exception) { }
+            }
+        }
+
+        /// <summary>Turns the monitor's brightness to its minimum and remembers the previous value.</summary>
+        private static void Dim(MonitorCard card)
+        {
+            if (card.Dimmed) return;
+            string device = card.Display.DeviceName;
+            // A value left by a run that could not restore it is the user's real setting; the monitor now reads lower.
+            if (SavedBrightness.Get(card.MonitorKey) < 0)
+            {
+                int current = Ddc.GetBrightness(device);
+                if (current < 0) return;
+                // Saved before dimming so that a crash while dimmed still restores it on the next start.
+                SavedBrightness.Set(card.MonitorKey, current);
+            }
+            card.Dimmed = Ddc.SetBrightness(device, 0);
+            if (!card.Dimmed) Undim(card, true);
+        }
+
+        private static void Undim(MonitorCard card, bool force = false)
+        {
+            if (!card.Dimmed && !force) return;
+            int original = SavedBrightness.Get(card.MonitorKey);
+            if (original >= 0 && Ddc.SetBrightness(card.Display.DeviceName, original)) SavedBrightness.Clear(card.MonitorKey);
+            card.Dimmed = false;
+        }
+
+        private void DimBacklightChanged()
+        {
+            DimPreference = dimBacklight.Checked;
+            foreach (var card in cards.Where(c => c.Blanked))
+            {
+                if (dimBacklight.Checked) Dim(card); else Undim(card);
+                card.Invalidate();
+            }
             UpdateStatus();
         }
 
@@ -640,8 +851,16 @@ namespace ScreenDimmer
         private void UpdateStatus()
         {
             status.Text = masks.Count == 0 ? "已连接 " + cards.Count + " 块屏幕 · 当前全部正常显示" :
-                masks.Count + " 块屏幕正在息屏 · 后台程序继续运行";
-            tray.Text = masks.Count == 0 ? "分屏息屏 · 全部正常显示" : "分屏息屏 · " + masks.Count + " 块屏幕已变黑";
+                masks.Count + " 块屏幕正在息屏" + DimSummary() + " · 后台程序继续运行";
+            tray.Text = masks.Count == 0 ? "分屏息屏 · 全部正常显示" : "分屏息屏 · " + masks.Count + " 块屏幕已息屏";
+        }
+
+        private string DimSummary()
+        {
+            int dimmed = cards.Count(c => c.Blanked && c.Dimmed);
+            if (!dimBacklight.Checked) return "";
+            if (dimmed == 0) return "（显示器不支持 DDC/CI 调亮度，仅黑屏遮罩）";
+            return dimmed == masks.Count ? "（亮度已调到最低）" : "（其中 " + dimmed + " 块亮度已调到最低）";
         }
 
         private void CenterOn(Screen screen)
@@ -711,6 +930,8 @@ namespace ScreenDimmer
                 }
                 bool wasActive = masks.Count > 0;
                 RestoreAll();
+                // A monitor unplugged while dimmed could not be restored then; it can be now that it is back.
+                SavedBrightness.RestoreLeftovers();
                 LoadScreens();
                 // Monitors that are still connected and still selected go dark again.
                 if (wasActive && cards.Any(c => c.Checked)) ApplySelection();
